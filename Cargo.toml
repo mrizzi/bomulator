@@ -1,18 +1,12 @@
-[workspace]
-resolver = "2"
-members = [
-    "bomulator-cli",
-    "entity",
-]
-
-[workspace.package]
+[package]
+name = "bomulator"
 version = "0.1.0"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
 authors = ["mrizzi"]
 
-[workspace.dependencies]
+[dependencies]
 clap = {version = "4.5", features = ["derive", "color"]}
 indicatif = "0.17"
 itertools = "0.14"
@@ -25,3 +19,8 @@ serde-cyclonedx = "0.9"
 spdx-rs = "0.5"
 tokio = { version = "1", features = ["full"] }
 zip = "2.6"
+
+[dev-dependencies]
+assert_cmd = "2.0.16"
+assert_fs = "1.1.2"
+json_diff_ng = "0.6.0"

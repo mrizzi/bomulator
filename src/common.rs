@@ -1,10 +1,11 @@
-use clap::{Parser, ValueEnum, arg};
-use entity::osv;
+use crate::entities::osv;
+use clap::ValueEnum;
 use indicatif::{ProgressBar, ProgressStyle};
 use itertools::Itertools;
 use packageurl::PackageUrl;
 use regex::Regex;
-use sea_orm::{ActiveValue, entity::prelude::*};
+use sea_orm::ActiveValue;
+use sea_orm::prelude::Uuid;
 use serde::{Deserialize, Serialize};
 use serde_cyclonedx::cyclonedx::v_1_6::{
     ComponentBuilder, CycloneDxBuilder, Metadata, MetadataTools, MetadataToolsVariant1, Property,
@@ -14,57 +15,33 @@ use spdx_rs::models::{
     CreationInfo, DocumentCreationInformation, ExternalPackageReference,
     ExternalPackageReferenceCategory, PackageInformation, PrimaryPackagePurpose, SPDX,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::ffi::{OsStr, OsString};
-use std::fmt::{Debug, Display};
-use std::fs::File;
-use std::io::{BufWriter, Cursor, Read, Write};
-use std::path::PathBuf;
+use std::fmt::Display;
+use std::fs;
+use std::io::{Cursor, Read};
 use std::str::FromStr;
 use std::thread::available_parallelism;
-use std::{collections::HashMap, env, fs};
 use tokio::task;
-use zip::read::ZipArchive;
+use zip::ZipArchive;
 
 const BOMULATOR_NAME: &str = env!("CARGO_PKG_NAME");
 const BOMULATOR_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Parser, Debug)]
-#[command(version, about, arg_required_else_help(true))]
-struct Args {
-    /// Path to the all.zip file available for download at https://storage.googleapis.com/osv-vulnerabilities/index.html
-    #[arg(short, long)]
-    input: String,
-
-    /// Path to store the output files. The default is the folder where the tool is executed from
-    #[arg(short, long, default_value = "")]
-    output_folder: String,
-
-    /// Optional comma-separated list of the PURL types that the selected packages must belong to.
-    /// If not provided, all the PURL types will be used.
-    #[arg(short = 't', long, value_delimiter = ',', value_enum)]
-    purl_types: Vec<PurlType>,
-
-    /// Total number of vulnerabilities requested in the generated SBOM
-    #[arg(short = 'v', long, default_value_t = 100)]
-    total_vulnerabilities: usize,
-
-    /// Total number of vulnerabilities requested in the generated SBOM
-    #[arg(hide = true, long, default_value_t = false)]
-    generate_purl_types: bool,
-}
-
 const PROGRESS_BAR_TEMPLATE: &str = "{elapsed} {wide_bar} {pos}/{len} ETA:{eta}";
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-    let zip_path = args.input.as_str();
+#[doc(hidden)]
+pub(crate) async fn _generate_sboms(
+    input: String,
+    purl_types: Vec<PurlType>,
+    total_vulnerabilities: usize,
+    generate_purl_types: bool,
+) -> Result<OutputSBOMs, Box<dyn Error>> {
+    let zip_path = input.as_str();
 
     let entities = concurrent(zip_path).await?;
 
-    let mut missing_vulnerabilities = args.total_vulnerabilities as i64;
+    let mut missing_vulnerabilities = total_vulnerabilities as i64;
     println!("Output file data gathering");
     let progress_bar = ProgressBar::new(missing_vulnerabilities as u64).with_style(
         ProgressStyle::with_template(PROGRESS_BAR_TEMPLATE).unwrap_or(ProgressStyle::default_bar()),
@@ -73,10 +50,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut spdx_package_information: Vec<PackageInformation> = vec![];
 
     let mut cves_already_added = HashSet::new();
-    let ecosystem_regex = match args.purl_types.is_empty() {
+    let ecosystem_regex = match purl_types.is_empty() {
         false => Regex::new(&format!(
             "^pkg:({})\\/",
-            args.purl_types.into_iter().map(|x| x.to_string()).join("|")
+            purl_types.into_iter().map(|x| x.to_string()).join("|")
         ))
         .unwrap(),
         true => Regex::new(".*").unwrap(),
@@ -87,7 +64,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .into_iter()
         // map the active model into a tuple (PURL, CVE)
         .map(|entity| {
-            if args.generate_purl_types {
+            if generate_purl_types {
                 purl_types.insert(
                     entity.purl.as_ref().to_string()
                         // "substring" the PURL type which always starts at the 4th char,
@@ -104,10 +81,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // filter out the tuple with purls not within the required ecosystems
         .filter(|entity| ecosystem_regex.is_match(&entity.0))
         .collect_vec();
-    if args.generate_purl_types {
+    if generate_purl_types {
         println!(
             "PURL types found in {} are:\n{:#?}",
-            args.input,
+            input,
             purl_types.iter().sorted()
         );
     }
@@ -184,14 +161,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     progress_bar.finish();
 
-    let total_vulnerabilities = args.total_vulnerabilities - missing_vulnerabilities as usize;
+    let total_vulnerabilities = total_vulnerabilities - missing_vulnerabilities as usize;
     let total_packages = cdx_components.len();
 
     let uuid = Uuid::new_v4();
     let sbom_name = format!("{} vulnerabilities", total_vulnerabilities);
     let sbom_version = format!("0.{}.{}", total_vulnerabilities, total_packages);
 
-    let cyclonedx = CycloneDxBuilder::default()
+    let cdx = CycloneDxBuilder::default()
         .bom_format("CycloneDX")
         .spec_version("1.6")
         .version(1)
@@ -228,8 +205,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .build()
         .unwrap();
 
-    let cdx =
-        serde_json::to_string_pretty(&cyclonedx).expect("CycloneDX JSON serialization failed");
+    let cyclonedx =
+        serde_json::to_string_pretty(&cdx).expect("CycloneDX JSON serialization failed");
 
     let package_spdx_identifier = "SPDXRef-0".to_string();
     spdx_package_information.push(PackageInformation {
@@ -274,65 +251,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         annotations: vec![],
         spdx_ref_counter: 0,
     };
+    let spdx = serde_json::to_string_pretty(&spdx).expect("SPDX JSON serialization failed");
 
-    let base_output_file_path: PathBuf = [
-        args.output_folder,
-        format!("{}-{}-{}", BOMULATOR_NAME, BOMULATOR_VERSION, uuid),
-    ]
-    .iter()
-    .collect();
-
-    let mut spdx_output_file_path = base_output_file_path.clone();
-    spdx_output_file_path = append_ext("spdx.json", spdx_output_file_path);
-    let file = File::create(spdx_output_file_path.as_path()).unwrap_or_else(|_| {
-        panic!(
-            "Failed to create SPDX SBOM file {:?}",
-            spdx_output_file_path
-        )
-    });
-    let mut writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, &spdx)?;
-    writer.flush()?;
-
-    let mut cdx_output_file_path = base_output_file_path.clone();
-    cdx_output_file_path = append_ext("cdx.json", cdx_output_file_path);
-    fs::write(cdx_output_file_path.as_path(), cdx).unwrap_or_else(|_| {
-        panic!(
-            "Failed to create CycloneDX SBOM file {:?}",
-            cdx_output_file_path
-        )
-    });
-
-    if missing_vulnerabilities > 0 {
-        println!(
-            "WARN: It has NOT been possible to create SBOMs with {} vulnerabilities as requested but with {} vulnerabilities",
-            args.total_vulnerabilities, total_vulnerabilities
-        );
-    }
-    println!("Created files:");
-    println!("{}", cdx_output_file_path.as_path().display());
-    println!("{}", spdx_output_file_path.as_path().display());
-    Ok(())
-}
-
-/// Returns a path with a new dotted extension component appended to the end.
-/// Note: does not check if the path is a file or directory; you should do that.
-/// # Example
-/// ```
-/// use pathext::append_ext;
-/// use std::path::PathBuf;
-/// let path = PathBuf::from("foo/bar/baz.txt");
-/// if !path.is_dir() {
-///    assert_eq!(append_ext("app", path), PathBuf::from("foo/bar/baz.txt.app"));
-/// }
-/// ```
-/// from https://internals.rust-lang.org/t/pathbuf-has-set-extension-but-no-add-extension-cannot-cleanly-turn-tar-to-tar-gz/14187
-///
-pub fn append_ext(ext: impl AsRef<OsStr>, path: PathBuf) -> PathBuf {
-    let mut os_string: OsString = path.into();
-    os_string.push(".");
-    os_string.push(ext.as_ref());
-    os_string.into()
+    Ok(OutputSBOMs {
+        uuid,
+        cyclonedx,
+        spdx,
+        missing_vulnerabilities,
+    })
 }
 
 async fn concurrent(zip_path: &str) -> Result<Vec<osv::ActiveModel>, Box<dyn Error>> {
@@ -439,7 +365,7 @@ async fn process_zip_path(
                                                     vec![]
                                                 }
                                             })
-                                            .collect::<Vec<osv::ActiveModel>>(),
+                                            .collect::<Vec<crate::entities::osv::ActiveModel>>(),
                                     );
                                 }
                                 // otherwise let's use the value reported in the ranges;
@@ -509,7 +435,7 @@ async fn process_zip_path(
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum PurlType {
+pub enum PurlType {
     Apk,
     Bitnami,
     Cargo,
@@ -576,9 +502,9 @@ impl Display for PurlType {
 }
 
 /// A schema for describing a vulnerability in an open source package. See also
-/// https://ossf.github.io/osv-schema/
+/// <https://ossf.github.io/osv-schema/>
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Osv {
+pub(crate) struct Osv {
     affected: Option<Vec<Affected>>,
     aliases: Option<Vec<String>>,
     credits: Option<Vec<Credit>>,
@@ -596,7 +522,7 @@ pub struct Osv {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Affected {
+pub(crate) struct Affected {
     database_specific: Option<HashMap<String, Option<serde_json::Value>>>,
     ecosystem_specific: Option<HashMap<String, Option<serde_json::Value>>>,
     package: Option<Package>,
@@ -606,14 +532,14 @@ pub struct Affected {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Package {
+pub(crate) struct Package {
     ecosystem: String,
     name: String,
     purl: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GitRangesRequireARepo {
+pub(crate) struct GitRangesRequireARepo {
     database_specific: Option<HashMap<String, Option<serde_json::Value>>>,
     events: Vec<EventsMustContainAnIntroducedObjectAndMayContainFixedLastAffectedOrLimitObject>,
     repo: Option<String>,
@@ -622,7 +548,7 @@ pub struct GitRangesRequireARepo {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EventsMustContainAnIntroducedObjectAndMayContainFixedLastAffectedOrLimitObject {
+pub(crate) struct EventsMustContainAnIntroducedObjectAndMayContainFixedLastAffectedOrLimitObject {
     introduced: Option<String>,
     fixed: Option<String>,
     last_affected: Option<String>,
@@ -640,7 +566,7 @@ pub enum RangeType {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct O {
+pub(crate) struct O {
     score: String,
     #[serde(rename = "type")]
     o_type: SeverityType,
@@ -658,7 +584,7 @@ pub enum SeverityType {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Credit {
+pub(crate) struct Credit {
     contact: Option<Vec<String>>,
     name: String,
     #[serde(rename = "type")]
@@ -684,7 +610,7 @@ pub enum CreditType {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Reference {
+pub(crate) struct Reference {
     #[serde(rename = "type")]
     reference_type: ReferenceType,
     url: String,
@@ -714,4 +640,11 @@ pub enum ReferenceType {
     Report,
     #[serde(rename = "WEB")]
     Web,
+}
+
+pub struct OutputSBOMs {
+    pub uuid: Uuid,
+    pub cyclonedx: String,
+    pub spdx: String,
+    pub missing_vulnerabilities: i64,
 }
