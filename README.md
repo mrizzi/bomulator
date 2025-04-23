@@ -14,6 +14,8 @@
 
 ## Usage
 
+### CLI
+
 You need to have installed [Docker](https://docs.docker.com/engine/install/) or [Podman](https://podman.io/docs/installation).
 
 1. Download the OSV data in the way you prefer among:
@@ -37,12 +39,21 @@ You need to have installed [Docker](https://docs.docker.com/engine/install/) or 
    
 In your local directory the two newly generated SBOMs will be available.
 
-### Input options
+#### Input options
 
 The available input options can be retrieved running:
 
 ```
 podman run quay.io/mrizzi/bomulator:latest
+```
+
+### Library
+
+The examples on how to leverage this library into Rust code are available in the [examples](./examples) folder.  
+You can give it a try to the `generate_sboms` example executing:
+
+```shell
+cargo run -r --example generate_sboms
 ```
 
 ---
