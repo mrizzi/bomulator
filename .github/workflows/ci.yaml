@@ -38,3 +38,9 @@ jobs:
         run: cargo check
       - name: Test
         run: cargo test -- --nocapture
+      - name: Check examples
+        run: |
+          for example in examples/*.rs
+          do
+            cargo run -r --example "$(basename  -s .rs "$example")" -- $args
+          done
